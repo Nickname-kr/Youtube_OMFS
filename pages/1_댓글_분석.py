@@ -149,22 +149,25 @@ editable_columns = [
     *CATEGORY_KEYWORDS.keys(), "의문문 유형", "불확실성 표현", "신뢰 표지", "비표준 표기·반복·이모티콘", "수기 확정",
 ]
 available_columns = [column for column in editable_columns if column in batch.columns]
+# 댓글 원문을 Data Editor의 왼쪽 고정 인덱스로 사용합니다.
+# 따라서 오른쪽 분류 열을 가로로 움직여도 원문을 계속 볼 수 있습니다.
+editor_batch = batch[available_columns].set_index("댓글 원문", drop=True)
 edited_batch = st.data_editor(
-    batch[available_columns],
+    editor_batch,
     use_container_width=True,
-    hide_index=True,
+    hide_index=False,
     height=700,
-    disabled=["comment_key", "댓글 원문", "좋아요 수", "작성일", "답글 수", "자동 제안 근거"],
+    disabled=["comment_key", "좋아요 수", "작성일", "답글 수", "자동 제안 근거"],
     column_config={
         "comment_key": None,
-        "댓글 원문": st.column_config.TextColumn(width="large"),
+        "_index": st.column_config.TextColumn("댓글 원문", width="large"),
         "자동 제안 근거": st.column_config.TextColumn(width="large"),
         "의문문 유형": st.column_config.SelectboxColumn(options=QUESTION_TYPES),
     },
     key=f"coding_editor_{filter_unconfirmed}_{page}",
 )
 if st.button("현재 페이지의 수기 코딩 저장", type="primary"):
-    save_batch(edited_batch)
+    save_batch(edited_batch.reset_index())
     st.success("저장했습니다.")
     st.rerun()
 
