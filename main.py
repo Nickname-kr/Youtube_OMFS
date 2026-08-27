@@ -148,13 +148,22 @@ def search_videos(query, api_key, page_token=None):
                 "채널명": snippet.get("channelTitle", ""),
                 "게시일": snippet.get("publishedAt", "")[:10],
                 "영상 길이": seconds_to_text(duration_seconds),
+                "duration_seconds": duration_seconds,
                 "조회수": int(statistics.get("viewCount", 0)),
                 "좋아요 수": int(statistics.get("likeCount", 0)),
                 "댓글 수": int(statistics.get("commentCount", 0)),
                 "링크": f"https://www.youtube.com/watch?v={item['id']}",
             }
         )
-    return sorted(rows, key=lambda row: row["조회수"], reverse=True), None, search_data.get("nextPageToken")
+    # 연구자가 요청한 두 가지 명확한 기준만 자동 적용합니다.
+    # 그 외 포함·제외 기준은 연구자가 직접 영상 내용을 보고 판단합니다.
+    filtered_rows = [
+        row
+        for row in rows
+        if row["duration_seconds"] >= 60
+        and "#shorts" not in row["영상 제목"].lower()
+    ]
+    return sorted(filtered_rows, key=lambda row: row["조회수"], reverse=True), None, search_data.get("nextPageToken")
 
 
 def fetch_comments(video_id, api_key):
@@ -237,19 +246,15 @@ if st.button("조회수순 영상 검색", type="primary"):
 
 candidates = st.session_state.get("video_candidates", [])
 if candidates:
-    st.success(f"현재 조회수순 후보 {len(candidates)}개입니다. 아래 **영상 제목을 클릭**해 선택하세요.")
+    st.success(f"현재 조회수순 후보 {len(candidates)}개입니다. 1분 이상이며 제목에 #shorts가 없는 영상만 표시합니다.")
     st.caption("포함·제외 기준은 표와 영상을 직접 확인하여 연구자가 최종 판단합니다.")
-    for row in candidates:
-        title_col, info_col = st.columns([3, 2])
-        with title_col:
-            if st.button(row["영상 제목"], key=f"pick_{row['video_id']}", use_container_width=True):
-                st.session_state["video_url_input"] = row["링크"]
-                st.session_state.pop("comments", None)
-        with info_col:
-            st.caption(f"조회수 {row['조회수']:,} · {row['영상 길이']} · {row['채널명']}")
-
-    candidate_table = pd.DataFrame(candidates).drop(columns=["video_id", "링크"])
-    st.dataframe(candidate_table, use_container_width=True, hide_index=True)
+    candidate_table = pd.DataFrame(candidates).drop(columns=["video_id", "duration_seconds"])
+    st.dataframe(
+        candidate_table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={"링크": st.column_config.LinkColumn("영상 링크", display_text="YouTube에서 열기")},
+    )
     copy_for_excel_button(candidate_table, "copy-videos", "영상 목록을 Excel용으로 복사")
 
     if st.session_state.get("search_next_token"):
