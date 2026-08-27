@@ -79,6 +79,13 @@ def copy_for_excel_button(dataframe, button_id, label):
     )
 
 
+def set_selected_video_url():
+    """검색 결과 선택 상자의 URL을 댓글 수집 입력칸으로 옮깁니다."""
+    selected = st.session_state.get("video_picker")
+    if selected:
+        st.session_state["video_url_input"] = selected[1]
+
+
 def api_get(endpoint, params):
     """YouTube Data API에 요청하고, 실패 이유를 한국어로 돌려줍니다."""
     try:
@@ -242,6 +249,7 @@ if st.button("조회수순 영상 검색", type="primary"):
             st.session_state["search_query"] = query.strip()
             st.session_state["search_next_token"] = next_token
             st.session_state.pop("video_url_input", None)
+            st.session_state.pop("video_picker", None)
             st.session_state.pop("comments", None)
 
 candidates = st.session_state.get("video_candidates", [])
@@ -253,7 +261,6 @@ if candidates:
         candidate_table,
         use_container_width=True,
         hide_index=True,
-        column_config={"링크": st.column_config.LinkColumn("영상 링크", display_text="YouTube에서 열기")},
     )
     copy_for_excel_button(candidate_table, "copy-videos", "영상 목록을 Excel용으로 복사")
 
@@ -276,6 +283,19 @@ if candidates:
         st.caption("더 불러올 검색 결과가 없습니다.")
 
 st.subheader("2. 댓글 가져오기")
+if candidates:
+    picker_options = [("", "", "직접 링크 붙여넣기")] + [
+        (row["video_id"], row["링크"], f"{row['영상 제목']}  |  조회수 {row['조회수']:,}")
+        for row in candidates
+    ]
+    st.selectbox(
+        "검색 결과에서 영상 선택",
+        options=picker_options,
+        format_func=lambda option: option[2],
+        key="video_picker",
+        on_change=set_selected_video_url,
+        help="여기서 고르면 아래 링크 입력칸에 자동으로 채워집니다.",
+    )
 video_url = st.text_input(
     "선택한 영상 링크",
     key="video_url_input",
