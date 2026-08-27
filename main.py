@@ -1,9 +1,11 @@
 import re
+import json
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 st.set_page_config(page_title="사랑니 YouTube 댓글 수집", page_icon="🦷", layout="wide")
@@ -35,6 +37,48 @@ def extract_video_id(url):
     return None
 
 
+def duration_to_seconds(value):
+    """API가 주는 PT1M30S 형식의 길이를 초 단위로 바꿉니다."""
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value or "")
+    if not match:
+        return 0
+    hours, minutes, seconds = (int(number or 0) for number in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def seconds_to_text(seconds):
+    """표에서 읽기 쉬운 영상 길이 표기입니다."""
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+def copy_for_excel_button(dataframe, button_id, label):
+    """탭으로 나눈 표를 클립보드에 넣어 Excel에 바로 붙여넣게 합니다."""
+    tab_separated = dataframe.to_csv(sep="\t", index=False)
+    # 댓글에 HTML처럼 보이는 문자가 있어도 버튼의 스크립트가 깨지지 않게 처리합니다.
+    payload = json.dumps(tab_separated, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    components.html(
+        f"""
+        <button id="{button_id}" style="padding:0.4rem 0.75rem; border:1px solid #d0d7de;
+        background:white; border-radius:0.4rem; cursor:pointer; font-size:0.9rem;">{label}</button>
+        <span id="{button_id}-status" style="margin-left:0.5rem; color:#16803c;"></span>
+        <script>
+        const button = document.getElementById({json.dumps(button_id)});
+        button.addEventListener('click', async () => {{
+          try {{
+            await navigator.clipboard.writeText({payload});
+            document.getElementById({json.dumps(button_id + '-status')}).textContent = '복사했습니다. Excel에 붙여넣으세요.';
+          }} catch (error) {{
+            document.getElementById({json.dumps(button_id + '-status')}).textContent = '복사에 실패했습니다. 표를 직접 선택해 복사해 주세요.';
+          }}
+        }});
+        </script>
+        """,
+        height=48,
+    )
+
+
 def api_get(endpoint, params):
     """YouTube Data API에 요청하고, 실패 이유를 한국어로 돌려줍니다."""
     try:
@@ -58,27 +102,30 @@ def api_get(endpoint, params):
     return None, "댓글을 가져오지 못했습니다. 비공개 영상·연령 제한·API 할당량 등의 사유일 수 있습니다."
 
 
-def search_videos(query, api_key):
+def search_videos(query, api_key, page_token=None):
     """검색어로 한국어권 후보 영상을 조회수순으로 불러옵니다."""
+    search_params = {
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "order": "viewCount",
+        "maxResults": 25,
+        "relevanceLanguage": "ko",
+        "regionCode": "KR",
+        "key": api_key,
+    }
+    if page_token:
+        search_params["pageToken"] = page_token
     search_data, error = api_get(
         "https://www.googleapis.com/youtube/v3/search",
-        {
-            "part": "snippet",
-            "q": query,
-            "type": "video",
-            "order": "viewCount",
-            "maxResults": 25,
-            "relevanceLanguage": "ko",
-            "regionCode": "KR",
-            "key": api_key,
-        },
+        search_params,
     )
     if error:
-        return [], error
+        return [], error, None
 
     ids = [item["id"]["videoId"] for item in search_data.get("items", [])]
     if not ids:
-        return [], "검색 결과가 없습니다. 검색어를 조금 바꾸어 보세요."
+        return [], "검색 결과가 없습니다. 검색어를 조금 바꾸어 보세요.", None
 
     # 검색 결과에는 길이·조회수·댓글 수가 없으므로 videos 창구에서 한 번 더 확인합니다.
     details, error = api_get(
@@ -86,26 +133,28 @@ def search_videos(query, api_key):
         {"part": "snippet,contentDetails,statistics", "id": ",".join(ids), "key": api_key},
     )
     if error:
-        return [], error
+        return [], error, None
 
     rows = []
     for item in details.get("items", []):
         snippet = item["snippet"]
         statistics = item.get("statistics", {})
+        title = snippet.get("title", "")
+        duration_seconds = duration_to_seconds(item.get("contentDetails", {}).get("duration"))
         rows.append(
             {
                 "video_id": item["id"],
-                "영상 제목": snippet.get("title", ""),
+                "영상 제목": title,
                 "채널명": snippet.get("channelTitle", ""),
                 "게시일": snippet.get("publishedAt", "")[:10],
-                "영상 길이": item.get("contentDetails", {}).get("duration", ""),
+                "영상 길이": seconds_to_text(duration_seconds),
                 "조회수": int(statistics.get("viewCount", 0)),
                 "좋아요 수": int(statistics.get("likeCount", 0)),
                 "댓글 수": int(statistics.get("commentCount", 0)),
                 "링크": f"https://www.youtube.com/watch?v={item['id']}",
             }
         )
-    return sorted(rows, key=lambda row: row["조회수"], reverse=True), None
+    return sorted(rows, key=lambda row: row["조회수"], reverse=True), None, search_data.get("nextPageToken")
 
 
 def fetch_comments(video_id, api_key):
@@ -176,26 +225,55 @@ if st.button("조회수순 영상 검색", type="primary"):
         st.warning("검색어를 입력해 주세요.")
     else:
         with st.spinner("조회수순 영상을 불러오는 중입니다..."):
-            videos, error = search_videos(query.strip(), api_key)
+            videos, error, next_token = search_videos(query.strip(), api_key)
         if error:
             st.error(error)
         else:
             st.session_state["video_candidates"] = videos
+            st.session_state["search_query"] = query.strip()
+            st.session_state["search_next_token"] = next_token
+            st.session_state.pop("video_url_input", None)
             st.session_state.pop("comments", None)
 
 candidates = st.session_state.get("video_candidates", [])
-selected_url = ""
 if candidates:
-    display_table = pd.DataFrame(candidates).drop(columns=["video_id", "링크"])
-    st.dataframe(display_table, use_container_width=True, hide_index=True)
-    options = {f"{row['영상 제목']}  |  조회수 {row['조회수']:,}": row["링크"] for row in candidates}
-    picked = st.selectbox("분석할 영상 선택", list(options), help="표를 보고 포함·제외 기준에 맞는 영상을 직접 선택해 주세요.")
-    selected_url = options[picked]
+    st.success(f"현재 조회수순 후보 {len(candidates)}개입니다. 아래 **영상 제목을 클릭**해 선택하세요.")
+    st.caption("포함·제외 기준은 표와 영상을 직접 확인하여 연구자가 최종 판단합니다.")
+    for row in candidates:
+        title_col, info_col = st.columns([3, 2])
+        with title_col:
+            if st.button(row["영상 제목"], key=f"pick_{row['video_id']}", use_container_width=True):
+                st.session_state["video_url_input"] = row["링크"]
+                st.session_state.pop("comments", None)
+        with info_col:
+            st.caption(f"조회수 {row['조회수']:,} · {row['영상 길이']} · {row['채널명']}")
+
+    candidate_table = pd.DataFrame(candidates).drop(columns=["video_id", "링크"])
+    st.dataframe(candidate_table, use_container_width=True, hide_index=True)
+    copy_for_excel_button(candidate_table, "copy-videos", "영상 목록을 Excel용으로 복사")
+
+    if st.session_state.get("search_next_token"):
+        if st.button("더보기 · 다음 25개 영상 불러오기"):
+            with st.spinner("추가 영상을 불러오는 중입니다..."):
+                new_videos, error, next_token = search_videos(
+                    st.session_state["search_query"], api_key, st.session_state["search_next_token"]
+                )
+            if error:
+                st.error(error)
+            else:
+                existing_ids = {row["video_id"] for row in candidates}
+                st.session_state["video_candidates"] = candidates + [
+                    row for row in new_videos if row["video_id"] not in existing_ids
+                ]
+                st.session_state["search_next_token"] = next_token
+                st.rerun()
+    else:
+        st.caption("더 불러올 검색 결과가 없습니다.")
 
 st.subheader("2. 댓글 가져오기")
 video_url = st.text_input(
     "선택한 영상 링크",
-    value=selected_url,
+    key="video_url_input",
     placeholder="https://www.youtube.com/watch?v=... 또는 https://youtu.be/...",
     help="검색 결과 대신 직접 붙여넣을 수도 있습니다. si= 등의 뒤쪽 값은 자동으로 무시됩니다.",
 )
@@ -220,6 +298,7 @@ if comments is not None:
     st.subheader("3. 수집 결과")
     st.metric("가져온 댓글 수", f"{len(comments):,}개")
     st.dataframe(comments, use_container_width=True, hide_index=True, height=520)
+    copy_for_excel_button(comments, "copy-comments", "댓글 표를 Excel용으로 복사")
     st.download_button(
         "댓글 CSV 내려받기",
         comments.to_csv(index=False).encode("utf-8-sig"),
