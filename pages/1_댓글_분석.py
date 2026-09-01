@@ -1,8 +1,11 @@
 """YouTube 댓글 분석 2단계: 키워드 자동 제안 + 연구자 수기 확정."""
 
+import hashlib
+import json
 import re
 
 import pandas as pd
+import requests
 import streamlit as st
 
 
@@ -26,6 +29,112 @@ CATEGORY_KEYWORDS = {
 QUESTION_TYPES = ["", "정보 요청", "확인 요청", "의사결정 위임"]
 UNCERTAINTY_WORDS = ["혹시", "괜찮을까요", "괜찮나", "무서워", "큰일", "걱정", "불안", "될까요"]
 TRUST_WORDS = ["의사 선생님", "의사쌤", "전문의", "병원", "치과", "유튜브 보고"]
+
+SHEET_HEADERS = [
+    "원본 유튜브 링크", "댓글 원문", "좋아요 수", "작성일", "답글 수", "자동 제안 근거",
+    "정보 질문", "개인 의사결정 질문", "수술 후 증상,회복", "합병증,위험 불안",
+    "자가관리 질문", "비용,접근성", "경험 공유", "정서 표현", "조언,오정보 가능성",
+    "단순 반응", "의문문유형", "불확실성 표현", "신뢰 표지", "비표준 표기,반복,이모티콘",
+]
+
+SHEET_BOOLEAN_MAP = {
+    "정보 질문": "정보 질문",
+    "개인 의사결정 질문": "개인 의사결정 질문",
+    "수술 후 증상,회복": "수술 후 증상·회복",
+    "합병증,위험 불안": "합병증·위험 불안",
+    "자가관리 질문": "자가관리 질문",
+    "비용,접근성": "비용·접근성",
+    "경험 공유": "경험 공유",
+    "정서 표현": "정서 표현",
+    "조언,오정보 가능성": "조언·오정보 가능성",
+    "단순 반응": "단순 반응",
+    "불확실성 표현": "불확실성 표현",
+    "신뢰 표지": "신뢰 표지",
+    "비표준 표기,반복,이모티콘": "비표준 표기·반복·이모티콘",
+}
+
+
+def get_sheet_url():
+    """Streamlit 비밀 금고에서 Google Apps Script 웹 앱 주소를 읽습니다."""
+    try:
+        return str(st.secrets["SHEET_URL"]).strip()
+    except (KeyError, FileNotFoundError):
+        return ""
+
+
+def ox(value):
+    """체크 여부를 Google Sheet에 기록할 o/x 값으로 바꿉니다."""
+    if pd.isna(value):
+        return "x"
+    return "o" if bool(value) else "x"
+
+
+def integer_or_zero(value):
+    """빈 숫자 셀도 시트에 안전하게 기록합니다."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def text_or_blank(value):
+    """CSV의 빈 텍스트를 nan 같은 문자열로 저장하지 않습니다."""
+    return "" if pd.isna(value) else str(value)
+
+
+def make_sheet_rows(edited_rows):
+    """현재 코딩 페이지를 사용자가 지정한 20개 Google Sheet 열로 변환합니다."""
+    sheet_rows = []
+    for _, row in edited_rows.iterrows():
+        item = {
+            "원본 유튜브 링크": text_or_blank(row.get("원본 유튜브 링크", "")),
+            "댓글 원문": text_or_blank(row.get("댓글 원문", "")),
+            "좋아요 수": integer_or_zero(row.get("좋아요 수", 0)),
+            "작성일": text_or_blank(row.get("작성일", "")),
+            "답글 수": integer_or_zero(row.get("답글 수", 0)),
+            "자동 제안 근거": text_or_blank(row.get("자동 제안 근거", "")),
+            "의문문유형": text_or_blank(row.get("의문문 유형", "")),
+        }
+        for sheet_column, coding_column in SHEET_BOOLEAN_MAP.items():
+            item[sheet_column] = ox(row.get(coding_column, False))
+        sheet_rows.append({header: item.get(header, "") for header in SHEET_HEADERS})
+    return sheet_rows
+
+
+def make_batch_id(sheet_rows):
+    """같은 20개가 중복 저장되지 않도록 전송 내용 기반 식별자를 만듭니다."""
+    canonical = json.dumps(sheet_rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def send_batch_to_sheet(sheet_rows):
+    """현재 페이지의 댓글들을 한 번의 POST 요청으로 Google Sheet에 저장합니다."""
+    sheet_url = get_sheet_url()
+    if not sheet_url:
+        return False, "Streamlit Secrets에 SHEET_URL을 추가해 주세요."
+    if not sheet_url.startswith("https://") or not sheet_url.rstrip("/").endswith("/exec"):
+        return False, "SHEET_URL은 https:// 로 시작하고 /exec 로 끝나는 웹 앱 주소여야 합니다."
+
+    payload = {
+        "action": "append_coding_batch",
+        "batch_id": make_batch_id(sheet_rows),
+        "headers": SHEET_HEADERS,
+        "rows": sheet_rows,
+    }
+    try:
+        response = requests.post(sheet_url, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as error:
+        return False, f"Google Sheet 접수창구에 연결하지 못했습니다: {error}"
+    except ValueError:
+        return False, "Google Sheet 접수창구가 JSON 형식으로 응답하지 않았습니다. Apps Script 배포를 확인해 주세요."
+
+    if not result.get("ok"):
+        return False, str(result.get("error", "Google Sheet 저장에 실패했습니다."))
+    if result.get("duplicate"):
+        return True, "이미 저장된 동일한 코딩 페이지입니다. 중복 행은 추가하지 않았습니다."
+    return True, f"현재 코딩 페이지 {int(result.get('inserted', len(sheet_rows)))}개를 Google Sheet에 저장했습니다."
 
 
 def find_matches(text, keywords):
@@ -114,7 +223,31 @@ if comments is None:
     st.info("먼저 ‘영상·댓글 수집’ 페이지에서 댓글을 가져오거나, 내려받은 댓글 CSV를 업로드해 주세요.")
     st.stop()
 
-source_signature = (len(comments), tuple(comments.columns), tuple(comments["댓글 원문"].astype(str).head(5)))
+# 새 수집 파일에는 원본 링크가 포함됩니다. 예전 CSV라면 사용자가 한 번만 입력합니다.
+comments = comments.copy()
+if "원본 유튜브 링크" not in comments.columns:
+    comments["원본 유튜브 링크"] = ""
+missing_source = comments["원본 유튜브 링크"].fillna("").astype(str).str.strip() == ""
+if missing_source.any():
+    current_video_id = st.session_state.get("current_video_id", "")
+    default_source_url = f"https://www.youtube.com/watch?v={current_video_id}" if current_video_id else ""
+    fallback_source_url = st.text_input(
+        "원본 유튜브 링크",
+        value=default_source_url,
+        placeholder="https://www.youtube.com/watch?v=...",
+        help="예전 CSV에 원본 링크 열이 없을 때, 이 CSV에 해당하는 영상 주소를 입력해 주세요.",
+    ).strip()
+    if not fallback_source_url:
+        st.info("Google Sheet에 출처를 남기기 위해 원본 유튜브 링크를 입력해 주세요.")
+        st.stop()
+    comments.loc[missing_source, "원본 유튜브 링크"] = fallback_source_url
+
+source_signature = (
+    len(comments),
+    tuple(comments.columns),
+    tuple(comments["댓글 원문"].astype(str).head(5)),
+    tuple(comments["원본 유튜브 링크"].astype(str).head(5)),
+)
 if st.session_state.get("coding_source_signature") != source_signature:
     st.session_state["coding_table"] = make_coding_table(comments)
     st.session_state["coding_source_signature"] = source_signature
@@ -122,6 +255,8 @@ if st.session_state.get("coding_source_signature") != source_signature:
 coding = st.session_state["coding_table"]
 confirmed = int(coding["수기 확정"].sum())
 st.success(f"{source_label} · 전체 {len(coding):,}개 댓글 중 {confirmed:,}개 수기 확정")
+if st.session_state.get("sheet_save_message"):
+    st.success(st.session_state.pop("sheet_save_message"))
 
 with st.expander("코딩 원칙과 자동 제안의 한계", expanded=False):
     st.markdown("""- 한 댓글은 여러 범주에 동시에 해당할 수 있으므로 **복수 선택**합니다.
@@ -145,7 +280,7 @@ st.subheader(f"수기 코딩 · {start + 1}–{min(start + page_size, len(visibl
 st.caption("각 체크박스를 수정한 뒤 아래 저장 버튼을 누르세요. ‘자동 제안 근거’는 수정하지 않습니다.")
 
 editable_columns = [
-    "comment_key", "댓글 원문", "좋아요 수", "작성일", "답글 수", "자동 제안 근거",
+    "comment_key", "원본 유튜브 링크", "댓글 원문", "좋아요 수", "작성일", "답글 수", "자동 제안 근거",
     *CATEGORY_KEYWORDS.keys(), "의문문 유형", "불확실성 표현", "신뢰 표지", "비표준 표기·반복·이모티콘", "수기 확정",
 ]
 available_columns = [column for column in editable_columns if column in batch.columns]
@@ -157,19 +292,36 @@ edited_batch = st.data_editor(
     use_container_width=True,
     hide_index=False,
     height=700,
-    disabled=["comment_key", "좋아요 수", "작성일", "답글 수", "자동 제안 근거"],
+    disabled=["comment_key", "원본 유튜브 링크", "좋아요 수", "작성일", "답글 수", "자동 제안 근거"],
     column_config={
         "comment_key": None,
+        "원본 유튜브 링크": None,
         "_index": st.column_config.TextColumn("댓글 원문", width="large"),
         "자동 제안 근거": st.column_config.TextColumn(width="large"),
         "의문문 유형": st.column_config.SelectboxColumn(options=QUESTION_TYPES),
     },
     key=f"coding_editor_{filter_unconfirmed}_{page}",
 )
-if st.button("현재 페이지의 수기 코딩 저장", type="primary"):
-    save_batch(edited_batch.reset_index())
-    st.success("저장했습니다.")
-    st.rerun()
+if st.button(f"현재 페이지 {len(batch)}개를 Google Sheet에 저장", type="primary"):
+    edited_rows = edited_batch.reset_index()
+    source_by_key = batch.set_index("comment_key")["원본 유튜브 링크"]
+    edited_rows["원본 유튜브 링크"] = edited_rows["comment_key"].map(source_by_key).fillna("")
+    unconfirmed_count = int((~edited_rows["수기 확정"].fillna(False).astype(bool)).sum())
+    if unconfirmed_count:
+        st.warning(
+            f"아직 ‘수기 확정’하지 않은 댓글이 {unconfirmed_count}개 있습니다. "
+            "현재 페이지의 모든 댓글을 확정한 뒤 다시 저장해 주세요."
+        )
+    else:
+        sheet_rows = make_sheet_rows(edited_rows)
+        with st.spinner(f"현재 페이지 {len(sheet_rows)}개를 Google Sheet에 저장하는 중입니다..."):
+            saved, message = send_batch_to_sheet(sheet_rows)
+        if saved:
+            save_batch(edited_rows)
+            st.session_state["sheet_save_message"] = message
+            st.rerun()
+        else:
+            st.error(message)
 
 st.divider()
 st.subheader("확정된 댓글의 현재 요약")
