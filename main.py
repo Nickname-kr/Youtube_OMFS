@@ -109,41 +109,71 @@ def api_get(endpoint, params):
     return None, "댓글을 가져오지 못했습니다. 비공개 영상·연령 제한·API 할당량 등의 사유일 수 있습니다."
 
 
-def search_videos(query, api_key, page_token=None):
-    """검색어로 한국어권 후보 영상을 조회수순으로 불러옵니다."""
-    search_params = {
-        "part": "snippet",
-        "q": query,
-        "type": "video",
-        "order": "viewCount",
-        "maxResults": 25,
-        "relevanceLanguage": "ko",
-        "regionCode": "KR",
-        "key": api_key,
-    }
-    if page_token:
-        search_params["pageToken"] = page_token
-    search_data, error = api_get(
-        "https://www.googleapis.com/youtube/v3/search",
-        search_params,
-    )
-    if error:
-        return [], error, None
+def search_videos(query, api_key, max_candidates=250):
+    """여러 검색 페이지를 자동 수집한 뒤 현재 조회수 기준으로 전체 정렬합니다."""
+    ids = []
+    seen_ids = set()
+    next_page_token = None
+    pages_loaded = 0
+    max_pages = max(1, (max_candidates + 49) // 50)
+    partial_warning = None
 
-    ids = [item["id"]["videoId"] for item in search_data.get("items", [])]
+    # search.list는 한 번에 최대 50개만 반환하므로 페이지를 내부에서 자동 순회합니다.
+    while pages_loaded < max_pages:
+        search_params = {
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "order": "viewCount",
+            "maxResults": min(50, max_candidates - pages_loaded * 50),
+            "relevanceLanguage": "ko",
+            "regionCode": "KR",
+            "key": api_key,
+        }
+        if next_page_token:
+            search_params["pageToken"] = next_page_token
+
+        search_data, error = api_get(
+            "https://www.googleapis.com/youtube/v3/search",
+            search_params,
+        )
+        if error:
+            if ids:
+                partial_warning = f"추가 페이지를 불러오지 못해 {pages_loaded}페이지까지만 수집했습니다: {error}"
+                break
+            return [], error, pages_loaded, 0, None
+
+        pages_loaded += 1
+        for item in search_data.get("items", []):
+            video_id = item.get("id", {}).get("videoId")
+            if video_id and video_id not in seen_ids:
+                seen_ids.add(video_id)
+                ids.append(video_id)
+
+        next_page_token = search_data.get("nextPageToken")
+        if not next_page_token:
+            break
+
     if not ids:
-        return [], "검색 결과가 없습니다. 검색어를 조금 바꾸어 보세요.", None
+        return [], "검색 결과가 없습니다. 검색어를 조금 바꾸어 보세요.", pages_loaded, 0, None
 
-    # 검색 결과에는 길이·조회수·댓글 수가 없으므로 videos 창구에서 한 번 더 확인합니다.
-    details, error = api_get(
-        "https://www.googleapis.com/youtube/v3/videos",
-        {"part": "snippet,contentDetails,statistics", "id": ",".join(ids), "key": api_key},
-    )
-    if error:
-        return [], error, None
+    # videos.list 역시 ID를 최대 50개씩 조회하고, 여기서 최신 조회수를 가져옵니다.
+    detail_items = []
+    for start in range(0, len(ids), 50):
+        details, error = api_get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            {
+                "part": "snippet,contentDetails,statistics",
+                "id": ",".join(ids[start : start + 50]),
+                "key": api_key,
+            },
+        )
+        if error:
+            return [], error, pages_loaded, len(ids), None
+        detail_items.extend(details.get("items", []))
 
     rows = []
-    for item in details.get("items", []):
+    for item in detail_items:
         snippet = item["snippet"]
         statistics = item.get("statistics", {})
         title = snippet.get("title", "")
@@ -170,7 +200,14 @@ def search_videos(query, api_key, page_token=None):
         if row["duration_seconds"] >= 60
         and "#shorts" not in row["영상 제목"].lower()
     ]
-    return sorted(filtered_rows, key=lambda row: row["조회수"], reverse=True), None, search_data.get("nextPageToken")
+    # 검색 페이지별 순서를 신뢰하지 않고, 모든 페이지를 합친 뒤 최신 조회수로 다시 정렬합니다.
+    return (
+        sorted(filtered_rows, key=lambda row: row["조회수"], reverse=True),
+        None,
+        pages_loaded,
+        len(ids),
+        partial_warning,
+    )
 
 
 def fetch_comments(video_id, api_key):
@@ -236,25 +273,42 @@ with st.expander("연구 설계: 포함·제외 기준과 수집 변수", expand
 
 st.subheader("1. 검색어로 영상 고르기")
 query = st.text_input("YouTube 검색어", value="사랑니 발치", placeholder="예: 매복 사랑니 발치")
+max_candidates = st.select_slider(
+    "한 번에 확인할 최대 검색 결과",
+    options=[50, 100, 250, 500],
+    value=250,
+    help="YouTube API가 한 요청당 최대 50개를 반환하므로 앱이 여러 페이지를 자동으로 불러옵니다.",
+)
+st.caption("한 번만 클릭하면 선택한 수만큼 자동 수집한 뒤, 현재 조회수 기준으로 전체 목록을 다시 정렬합니다.")
 if st.button("조회수순 영상 검색", type="primary"):
     if not query.strip():
         st.warning("검색어를 입력해 주세요.")
     else:
-        with st.spinner("조회수순 영상을 불러오는 중입니다..."):
-            videos, error, next_token = search_videos(query.strip(), api_key)
+        with st.spinner("여러 검색 페이지를 자동으로 불러와 전체 조회수순으로 정렬하는 중입니다..."):
+            videos, error, pages_loaded, raw_count, partial_warning = search_videos(
+                query.strip(), api_key, max_candidates=max_candidates
+            )
         if error:
             st.error(error)
         else:
             st.session_state["video_candidates"] = videos
             st.session_state["search_query"] = query.strip()
-            st.session_state["search_next_token"] = next_token
+            st.session_state["search_pages_loaded"] = pages_loaded
+            st.session_state["search_raw_count"] = raw_count
+            st.session_state["search_partial_warning"] = partial_warning
             st.session_state.pop("video_url_input", None)
             st.session_state.pop("video_picker", None)
             st.session_state.pop("comments", None)
 
 candidates = st.session_state.get("video_candidates", [])
 if candidates:
-    st.success(f"현재 조회수순 후보 {len(candidates)}개입니다. 1분 이상이며 제목에 #shorts가 없는 영상만 표시합니다.")
+    st.success(
+        f"검색 {st.session_state.get('search_pages_loaded', 0)}페이지에서 "
+        f"중복 제거 후 {st.session_state.get('search_raw_count', len(candidates))}개를 확인했고, "
+        f"포함 기준을 자동 적용한 후보 {len(candidates)}개를 전체 조회수순으로 정렬했습니다."
+    )
+    if st.session_state.get("search_partial_warning"):
+        st.warning(st.session_state["search_partial_warning"])
     st.caption("포함·제외 기준은 표와 영상을 직접 확인하여 연구자가 최종 판단합니다.")
     candidate_table = pd.DataFrame(candidates).drop(columns=["video_id", "duration_seconds"])
     st.dataframe(
@@ -263,24 +317,6 @@ if candidates:
         hide_index=True,
     )
     copy_for_excel_button(candidate_table, "copy-videos", "영상 목록을 Excel용으로 복사")
-
-    if st.session_state.get("search_next_token"):
-        if st.button("더보기 · 다음 25개 영상 불러오기"):
-            with st.spinner("추가 영상을 불러오는 중입니다..."):
-                new_videos, error, next_token = search_videos(
-                    st.session_state["search_query"], api_key, st.session_state["search_next_token"]
-                )
-            if error:
-                st.error(error)
-            else:
-                existing_ids = {row["video_id"] for row in candidates}
-                st.session_state["video_candidates"] = candidates + [
-                    row for row in new_videos if row["video_id"] not in existing_ids
-                ]
-                st.session_state["search_next_token"] = next_token
-                st.rerun()
-    else:
-        st.caption("더 불러올 검색 결과가 없습니다.")
 
 st.subheader("2. 댓글 가져오기")
 if candidates:
